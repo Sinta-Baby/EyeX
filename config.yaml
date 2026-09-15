@@ -1,0 +1,24 @@
+project:
+  name: RetinaSense
+  version: 1.0
+
+model:
+  name: EfficientNetB3
+  image_size: 300
+  batch_size: 16
+  epochs: 50
+  learning_rate: 0.0001
+
+dataset:
+  train_path: datasets/train
+  validation_path: datasets/validation
+  test_path: datasets/test
+
+prediction:
+  threshold: 0.5
+
+streamlit:
+  theme: light
+
+logging:
+  level: INFO

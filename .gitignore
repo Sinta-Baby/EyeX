@@ -1,0 +1,110 @@
+@"
+# ==========================================================
+# EyeX - .gitignore
+# ==========================================================
+
+# Virtual Environments
+.venv/
+venv/
+renv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# Operating System
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment Variables / Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# ==========================================================
+# Datasets - DO NOT UPLOAD
+# ==========================================================
+datasets/
+
+# ==========================================================
+# Model Checkpoints - DO NOT UPLOAD
+# ==========================================================
+saved_models/
+checkpoints/
+
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.keras
+*.onnx
+
+# ==========================================================
+# Generated Results / Training Outputs
+# ==========================================================
+results/
+training_results/
+outputs/
+exports/
+runs/
+predictions/
+analysis/results/
+
+# TensorBoard
+tensorboard/
+events.out.tfevents.*
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Build Files
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# Database Files
+*.sqlite3
+
+# Miscellaneous
+*.pid
+"@ | Set-Content .gitignore
