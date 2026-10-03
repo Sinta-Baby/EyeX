@@ -108,3 +108,6 @@ htmlcov/
 # Miscellaneous
 *.pid
 "@ | Set-Content .gitignore
+
+
+reports/*.pdf
