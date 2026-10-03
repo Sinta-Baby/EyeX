@@ -1,197 +1,149 @@
-# 👁️ RetinaSense
+# 👁️ EyeX — AI-Powered Multi-Disease Retinal Screening System
 
-**A Deep Learning-Based Multi-Disease Retinal Disease Classification System**
+<p align="center">
+  <b>Deep Learning • Retinal Image Analysis • Explainable AI • Lesion Segmentation • Clinical Reporting</b>
+</p>
 
-RetinaSense is a deep learning project designed to automatically classify retinal fundus images into multiple eye disease categories using state-of-the-art convolutional neural networks. The project focuses on building an accurate, scalable, and explainable retinal disease screening system.
-
----
-
-## 🎯 Project Objectives
-
-- Detect multiple retinal diseases from fundus images
-- Perform automated retinal disease classification
-- Build a robust preprocessing pipeline
-- Train a deep learning model using EfficientNet-B3
-- Provide explainable AI predictions using Grad-CAM
-- Deploy the model through a Streamlit web application
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.x-blue?logo=python" />
+  <img src="https://img.shields.io/badge/PyTorch-Deep%20Learning-ee4c2c?logo=pytorch" />
+  <img src="https://img.shields.io/badge/Streamlit-Web%20Application-ff4b4b?logo=streamlit" />
+  <img src="https://img.shields.io/badge/OpenCV-Computer%20Vision-5C3EE8?logo=opencv" />
+  <img src="https://img.shields.io/badge/U--Net-Lesion%20Segmentation-green" />
+  <img src="https://img.shields.io/badge/Grad--CAM-Explainable%20AI-purple" />
+</p>
 
 ---
 
-## 🩺 Supported Disease Classes
+## 📌 Overview
 
-- ✅ Healthy Retina
-- ✅ Diabetic Retinopathy (DR)
-- ✅ Glaucoma
-- ✅ Age-related Macular Degeneration (AMD)
+**EyeX** is an AI-assisted retinal screening and analysis system designed to analyze retinal fundus images using deep learning and computer vision techniques.
 
----
+The system extends a conventional retinal disease classification pipeline into a broader screening workflow by combining:
 
-## 📂 Dataset
+- 🩺 Retinal disease classification
+- 🔍 Image quality assessment
+- 🧠 Explainable AI using Grad-CAM
+- 🤖 Comparison of multiple deep learning architectures
+- 🔬 Diabetic retinopathy lesion segmentation
+- 📊 Model agreement analysis
+- 📄 Automated clinical-style PDF reporting
 
-The RetinaSense dataset is built by combining multiple publicly available retinal image datasets:
-
-- ODIR
-- APTOS 2019 Blindness Detection
-- ARMD Dataset
-- Glaucoma Dataset
-
-After preprocessing:
-
-| Split | Images |
-|-------|-------:|
-| Training | 8,971 |
-| Validation | 1,121 |
-| Testing | 1,122 |
-| **Total** | **11,214** |
+EyeX is designed as a **research prototype and AI-assisted screening system**. It is not intended to replace ophthalmologists or provide an autonomous medical diagnosis.
 
 ---
 
-## 🚀 Features
+# 🎯 Project Aim
 
-### ✅ Completed
+The aim of EyeX is to develop a deep-learning-based retinal screening platform capable of extracting multiple forms of information from fundus images instead of producing only a single disease label.
 
-- Unified dataset preprocessing pipeline
-- Metadata generation
-- Dataset cleaning
-- Train/Validation/Test splitting
-- Duplicate filename handling
-- Dataset verification
+The system combines classification, image analysis, explainability, segmentation, and reporting into a single workflow.
 
-### 🚧 In Progress
+### Current disease classes
 
-- EfficientNet-B3 training
-- Model evaluation
-- Performance visualization
+EyeX's primary classification model performs **single-label classification** into four categories:
 
-### 🔮 Planned
-
-- Grad-CAM Explainability
-- Streamlit Web Application
-- PDF Medical Report Generation
-- Prediction Confidence Scores
+1. Healthy
+2. Diabetic Retinopathy (DR)
+3. Glaucoma
+4. Age-Related Macular Degeneration (AMD)
 
 ---
 
-## 🛠️ Technology Stack
+# ✨ Key Features
 
-- Python
-- PyTorch
-- OpenCV
-- Pandas
-- NumPy
-- Scikit-learn
-- Matplotlib
-- Streamlit (Planned)
+## 1. 🖼️ Fundus Image Upload
+
+Users can upload a retinal fundus image through the Streamlit interface.
+
+Supported image formats include:
+
+- JPG
+- JPEG
+- PNG
+- BMP
+- TIFF
+
+The application displays basic image information such as:
+
+- File name
+- Image format
+- Resolution
 
 ---
 
-## 📁 Project Structure
+## 2. 🔍 Image Quality Assessment
+
+Before AI analysis, EyeX evaluates the quality of the uploaded retinal image.
+
+The current quality assessment considers:
+
+- **Sharpness**
+- **Brightness**
+- **Contrast**
+- **Resolution**
+
+The system produces an overall quality status such as:
+
+- Good
+- Fair
+- Poor
+
+This helps identify images that may not be suitable for reliable AI analysis.
+
+> Image quality assessment is a preprocessing/screening aid and does not determine whether a patient has a retinal disease.
+
+---
+
+# 🧠 3. Retinal Disease Classification
+
+The original EyeX classification pipeline uses:
+
+### EfficientNet-B3
+
+The EfficientNet-B3 model was adapted for four-class retinal disease classification.
+
+### Classification output
+
+For an uploaded image, the system provides:
+
+- Predicted condition
+- Model confidence
+- Grad-CAM explanation
+
+The existing EfficientNet-B3 model is preserved as the primary classification baseline.
+
+---
+
+# 🤖 4. Multi-Model Classification Comparison
+
+EyeX also evaluates the uploaded image using three different deep learning architectures:
+
+| Model | Architecture Type |
+|---|---|
+| EfficientNet-B3 | CNN |
+| ConvNeXt-Tiny | Modern CNN |
+| Swin-Tiny | Vision Transformer |
+
+The comparison provides:
+
+- Prediction from each model
+- Current-image confidence
+- Model agreement
+- Final comparison prediction
+
+This allows the system to examine whether different architectures produce consistent predictions for the same retinal image.
+
+### Important distinction
+
+The confidence shown for an individual uploaded image is **not the same as dataset-level model accuracy**.
+
+For example:
 
 ```text
-RetinaSense/
-│
-├── core/
-├── datasets/
-├── models/
-├── scripts/
-├── utils/
-├── checkpoints/
-├── outputs/
-├── app.py
-├── requirements.txt
-└── README.md
-```
+Current-image confidence:
+Swin-Tiny → 100%
 
----
+does NOT mean:
 
-## 📊 Current Progress
-
-- ✅ Dataset Collection
-- ✅ Dataset Preprocessing
-- ✅ Metadata Generation
-- ✅ Dataset Splitting
-- ✅ Image Copying
-- ✅ Dataset Verification
-- 🚧 Model Training
-- ⏳ Evaluation
-- ⏳ Deployment
-
----
-## Installation
-
-Clone the repository
-
-```bash
-git clone https://github.com/Sinta-Baby/RetinaSense.git
-cd RetinaSense
-```
-
-Create a virtual environment
-
-```bash
-python -m venv renv
-```
-
-Windows
-
-```bash
-renv\Scripts\activate
-```
-
-Linux / macOS
-
-```bash
-source renv/bin/activate
-```
-
-Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
----
-
-## Dataset Setup
-
-Download the required retinal datasets and place them in:
-
-```
-datasets/raw/
-```
-
-Then run:
-
-```bash
-python -m scripts.build_dataset
-python -m scripts.split_dataset
-python -m scripts.copy_images
-```
-
-The final dataset will contain:
-
-| Split | Images |
-|------|-------:|
-| Train | 8971 |
-| Validation | 1121 |
-| Test | 1122 |
-| Total | 11214 |
-
-Verify the dataset:
-
-```bash
-python -m scripts.dataset_statistics
-```
-## 👩‍💻 Developer
-
-**Sinta Baby**
-
-Integrated M.Sc. Computer Science (Data Science)  
-Nirmala College, Muvattupuzha  
-Mahatma Gandhi University, Kerala, India
-
----
-
-## 📄 License
-
-This project is developed for academic and research purposes.
+Swin-Tiny test accuracy → 100%
