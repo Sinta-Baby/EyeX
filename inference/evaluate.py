@@ -1,236 +1,282 @@
+
 """
-==========================================================
-RetinaSense
-
-Model Evaluation
-
-Description:
-Evaluates the trained RetinaSense model
-on the test dataset.
-
-==========================================================
+EyeX - Evaluation and Comparison of Three Classification Models
+Evaluates all models on the same RetinaSense test dataset.
 """
 
+import os
+import time
 import torch
 import pandas as pd
+import torch.nn.functional as F
 
 from sklearn.metrics import (
     accuracy_score,
+    balanced_accuracy_score,
     classification_report,
-    confusion_matrix
+    confusion_matrix,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    f1_score,
 )
 
-from models.efficientnet_b3 import build_model
 from utils.dataloader import get_dataloaders
 from core.constants import INDEX_TO_DISEASE
+from inference.classification_models import (
+    load_model,
+    MODEL_CONFIGS,
+    EFFICIENTNET_CLASS_NAMES,
+    NEW_MODEL_CLASS_NAMES,
+    DEVICE,
+)
 
 
-# ======================================================
-# Main
-# ======================================================
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-def main():
+# Canonical order used by the RetinaSense test dataset.
+CLASS_NAMES = [INDEX_TO_DISEASE[i] for i in range(4)]
+NUM_CLASSES = len(CLASS_NAMES)
 
-    print("=" * 70)
-    print("RetinaSense Model Evaluation")
-    print("=" * 70)
+# Output-index-to-class-name mappings for each model.
+MODEL_CLASS_NAMES = {
+    "EfficientNet-B3": EFFICIENTNET_CLASS_NAMES,
+    "ConvNeXt-Tiny": NEW_MODEL_CLASS_NAMES,
+    "Swin-Tiny": NEW_MODEL_CLASS_NAMES,
+}
 
-    # ------------------------------------------
-    # Device
-    # ------------------------------------------
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
+def calculate_specificity(y_true, y_pred):
+    """Calculate one-vs-rest specificity for each class."""
+    matrix = confusion_matrix(
+        y_true, y_pred, labels=list(range(NUM_CLASSES))
     )
 
-    print(f"Device : {device}")
+    specificities = {}
 
-    # ------------------------------------------
-    # Dataset
-    # ------------------------------------------
+    for i, class_name in enumerate(CLASS_NAMES):
+        true_negative = matrix.sum() - (
+            matrix[i, :].sum()
+            + matrix[:, i].sum()
+            - matrix[i, i]
+        )
+        false_positive = matrix[:, i].sum() - matrix[i, i]
 
-    dataset_root = "datasets/RetinaSense_Dataset"
+        denominator = true_negative + false_positive
 
-    train_loader, validation_loader, test_loader = (
-        get_dataloaders(dataset_root)
-    )
+        specificities[class_name] = (
+            true_negative / denominator
+            if denominator else 0.0
+        )
 
-    print("\nTest Dataset Loaded")
-    print(f"Test Images : {len(test_loader.dataset)}")
+    return specificities
 
-    # ------------------------------------------
-    # Build Model
-    # ------------------------------------------
 
-    model = build_model(
-        pretrained=False
-    )
+def evaluate_model(model_name, test_loader):
+    print(f"\nEvaluating {model_name}...")
 
-    # ------------------------------------------
-    # Load Best Model
-    # ------------------------------------------
+    model = load_model(model_name)
+    output_names = MODEL_CLASS_NAMES[model_name]
 
-    model_path = "saved_models/best_model.pth"
+    # Translate output classes to the test dataset's label indices.
+    canonical_index = {
+        name: index for index, name in enumerate(CLASS_NAMES)
+    }
 
-    checkpoint = torch.load(
-        model_path,
-        map_location=device
-    )
-
-    model.load_state_dict(checkpoint)
-
-    model = model.to(device)
-
-    model.eval()
-
-    print("\n✅ Best model loaded successfully.")
-
-    # ------------------------------------------
-    # Prediction
-    # ------------------------------------------
+    try:
+        output_to_canonical = [
+            canonical_index[name] for name in output_names
+        ]
+    except KeyError as exc:
+        raise ValueError(
+            f"Class mapping mismatch for {model_name}: {exc}. "
+            f"Dataset classes: {CLASS_NAMES}; "
+            f"model classes: {output_names}"
+        ) from exc
 
     actual_labels = []
     predicted_labels = []
+    total_inference_seconds = 0.0
+    total_images = 0
 
-    print("\nRunning Test Evaluation...")
+    model.eval()
 
-    with torch.no_grad():
-
+    with torch.inference_mode():
         for images, labels in test_loader:
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
 
-            images = images.to(device)
+            input_size = MODEL_CONFIGS[model_name]["input_size"]
 
+            # Test loader supplies the existing RetinaSense transforms.
+            # Resize normalized tensors for the 224x224 models.
+            if images.shape[-2:] != (input_size, input_size):
+                images = F.interpolate(
+                    images,
+                    size=(input_size, input_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            if DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+
+            start = time.perf_counter()
             outputs = model(images)
 
-            predictions = torch.argmax(
-                outputs,
-                dim=1
-            )
+            if DEVICE.type == "cuda":
+                torch.cuda.synchronize()
 
-            actual_labels.extend(
-                labels.numpy()
-            )
+            total_inference_seconds += time.perf_counter() - start
 
-            predicted_labels.extend(
-                predictions.cpu().numpy()
-            )
+            predicted_output_indices = outputs.argmax(dim=1).cpu().tolist()
+            predicted_canonical = [
+                output_to_canonical[i]
+                for i in predicted_output_indices
+            ]
 
-    # ------------------------------------------
-    # Accuracy
-    # ------------------------------------------
+            actual_labels.extend(labels.cpu().tolist())
+            predicted_labels.extend(predicted_canonical)
+            total_images += labels.size(0)
 
-    accuracy = accuracy_score(
-        actual_labels,
-        predicted_labels
+    if total_images == 0:
+        raise ValueError("The test dataset is empty.")
+
+    accuracy = accuracy_score(actual_labels, predicted_labels)
+    balanced_accuracy = balanced_accuracy_score(
+        actual_labels, predicted_labels
     )
-
-    print("\n" + "=" * 70)
-    print("Evaluation Results")
-    print("=" * 70)
-
-    print(
-        f"Test Accuracy : {accuracy * 100:.2f}%"
+    macro_precision = precision_score(
+        actual_labels, predicted_labels,
+        labels=list(range(NUM_CLASSES)),
+        average="macro", zero_division=0
     )
+    macro_recall = recall_score(
+        actual_labels, predicted_labels,
+        labels=list(range(NUM_CLASSES)),
+        average="macro", zero_division=0
+    )
+    macro_f1 = f1_score(
+        actual_labels, predicted_labels,
+        labels=list(range(NUM_CLASSES)),
+        average="macro", zero_division=0
+    )
+    weighted_precision = precision_score(
+        actual_labels, predicted_labels,
+        average="weighted", zero_division=0
+    )
+    weighted_recall = recall_score(
+        actual_labels, predicted_labels,
+        average="weighted", zero_division=0
+    )
+    weighted_f1 = f1_score(
+        actual_labels, predicted_labels,
+        average="weighted", zero_division=0
+    )
+    mcc = matthews_corrcoef(actual_labels, predicted_labels)
 
-    # ------------------------------------------
-    # Classification Report
-    # ------------------------------------------
+    specificities = calculate_specificity(
+        actual_labels, predicted_labels
+    )
+    macro_specificity = sum(specificities.values()) / NUM_CLASSES
 
-    target_names = [
-        INDEX_TO_DISEASE[0],
-        INDEX_TO_DISEASE[1],
-        INDEX_TO_DISEASE[2],
-        INDEX_TO_DISEASE[3]
-    ]
+    average_inference_ms = (
+        total_inference_seconds / total_images
+    ) * 1000
 
     report = classification_report(
         actual_labels,
         predicted_labels,
-        target_names=target_names,
+        labels=list(range(NUM_CLASSES)),
+        target_names=CLASS_NAMES,
         output_dict=True,
-        zero_division=0
+        zero_division=0,
     )
-
-    report_df = pd.DataFrame(
-        report
-    ).transpose()
-
-    print("\nClassification Report")
-    print("-" * 70)
-
-    print(
-        report_df.round(4)
-    )
-
-    # ------------------------------------------
-    # Save Classification Report
-    # ------------------------------------------
-
-    report_path = (
-        "results/classification_report.csv"
-    )
-
-    report_df.to_csv(
-        report_path
-    )
-
-    print(
-        f"\nClassification report saved to:"
-        f" {report_path}"
-    )
-
-    # ------------------------------------------
-    # Confusion Matrix
-    # ------------------------------------------
 
     matrix = confusion_matrix(
         actual_labels,
-        predicted_labels
+        predicted_labels,
+        labels=list(range(NUM_CLASSES)),
     )
 
-    matrix_df = pd.DataFrame(
-        matrix,
-        index=target_names,
-        columns=target_names
+    # Save detailed report and confusion matrix separately per model.
+    safe_name = model_name.lower().replace("-", "_")
+
+    pd.DataFrame(report).transpose().to_csv(
+        os.path.join(RESULTS_DIR, f"{safe_name}_report.csv")
     )
 
-    print("\nConfusion Matrix")
-    print("-" * 70)
-
-    print(matrix_df)
-
-    # ------------------------------------------
-    # Save Confusion Matrix
-    # ------------------------------------------
-
-    matrix_path = (
-        "results/confusion_matrix.csv"
+    pd.DataFrame(
+        matrix, index=CLASS_NAMES, columns=CLASS_NAMES
+    ).to_csv(
+        os.path.join(RESULTS_DIR, f"{safe_name}_confusion_matrix.csv")
     )
 
-    matrix_df.to_csv(
-        matrix_path
+    pd.DataFrame(
+        [{"class": name, "specificity": value}
+         for name, value in specificities.items()]
+    ).to_csv(
+        os.path.join(RESULTS_DIR, f"{safe_name}_specificity.csv"),
+        index=False,
     )
 
-    print(
-        f"\nConfusion matrix saved to:"
-        f" {matrix_path}"
+    del model
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return {
+        "Model": model_name,
+        "Test Images": total_images,
+        "Accuracy": accuracy,
+        "Balanced Accuracy": balanced_accuracy,
+        "Macro Precision": macro_precision,
+        "Macro Recall": macro_recall,
+        "Macro F1": macro_f1,
+        "Weighted Precision": weighted_precision,
+        "Weighted Recall": weighted_recall,
+        "Weighted F1": weighted_f1,
+        "Macro Specificity": macro_specificity,
+        "MCC": mcc,
+        "Avg Inference (ms/image)": average_inference_ms,
+    }
+
+
+def main():
+    print("=" * 75)
+    print("EyeX - Three-Model Evaluation")
+    print("=" * 75)
+    print(f"Device: {DEVICE}")
+    print(f"Class order: {CLASS_NAMES}")
+
+    _, _, test_loader = get_dataloaders(
+        "datasets/RetinaSense_Dataset"
     )
 
-    # ------------------------------------------
-    # Finished
-    # ------------------------------------------
+    print(f"Test images: {len(test_loader.dataset)}")
 
-    print("\n" + "=" * 70)
-    print("Evaluation Completed Successfully")
-    print("=" * 70)
+    results = []
 
+    for model_name in MODEL_CONFIGS:
+        try:
+            results.append(evaluate_model(model_name, test_loader))
+        except Exception as exc:
+            print(f"\nERROR evaluating {model_name}: {exc}")
+            raise
 
-# ======================================================
-# Run
-# ======================================================
+    comparison = pd.DataFrame(results)
+    comparison.to_csv(
+        os.path.join(RESULTS_DIR, "model_comparison.csv"),
+        index=False,
+    )
+
+    print("\n" + "=" * 75)
+    print("MODEL COMPARISON")
+    print("=" * 75)
+    print(comparison.round(4).to_string(index=False))
+    print(f"\nSaved comparison to {RESULTS_DIR}/model_comparison.csv")
+    print("Evaluation completed.")
+
 
 if __name__ == "__main__":
-
     main()

@@ -3,6 +3,9 @@ EyeX — Explainable Retinal AI  (dark app-style UI)
 Single-file app with three pages: Upload & Quality · AI Analysis · Clinical Report.
 Model / inference / report logic is unchanged; only the interface layer is new.
 
+Test-set evaluation metrics (Accuracy, Macro F1 and the detailed table) are read at
+runtime from results/model_comparison.csv next to this file. Nothing is hardcoded.
+
 Tip: for the best dark rendering, add .streamlit/config.toml with
     [theme]
     base = "dark"
@@ -10,6 +13,11 @@ Tip: for the best dark rendering, add .streamlit/config.toml with
 
 import io
 import os
+import csv
+import math
+from html import escape
+from pathlib import Path
+
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 
@@ -18,6 +26,7 @@ from inference.classification_models import predict_all_models, calculate_model_
 from inference.lesion_detector import IDRiDLesionDetector
 from reports.pdf_report import generate_pdf_report, generate_report_id
 from processors.image_quality import assess_image_quality
+from utils.fundus_validator import validate_fundus_image
 
 st.set_page_config(page_title="EyeX | Explainable Retinal AI", page_icon="👁️",
                    layout="wide", initial_sidebar_state="expanded")
@@ -33,13 +42,237 @@ def md(text):
     st.markdown(h(text), unsafe_allow_html=True)
 
 
+def esc(value):
+    """HTML-escape any value before interpolating it into markup."""
+    return escape(str(value), quote=True)
+
+
 def section(title, sub=""):
     md(f'<div class="x-title">{title}</div>' + (f'<div class="x-sub">{sub}</div>' if sub else ""))
+
+
+def safe_float(value, default=0.0):
+    """float() that never raises and never returns NaN/inf."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def clamp_pct(value):
+    """Clamp a percentage into the valid 0-100 range."""
+    return max(0.0, min(100.0, safe_float(value)))
 
 
 @st.cache_resource
 def load_lesion_detector():
     return IDRiDLesionDetector()
+
+
+# ======================================================
+# Test-set evaluation metrics (source of truth: results/model_comparison.csv)
+# ======================================================
+EVAL_MODELS = ("EfficientNet-B3", "ConvNeXt-Tiny", "Swin-Tiny")
+EVAL_CSV_PATH = Path(__file__).resolve().parent / "results" / "model_comparison.csv"
+
+# Internal key -> accepted header spellings (after _norm_col normalisation).
+_COLUMN_ALIASES = {
+    "model": ("model", "model name"),
+    "test_images": ("test images", "test image count"),
+    "accuracy": ("accuracy", "test accuracy"),
+    "balanced_accuracy": ("balanced accuracy",),
+    "macro_precision": ("macro precision",),
+    "macro_recall": ("macro recall",),
+    "macro_f1": ("macro f1", "macro f1 score", "f1 macro", "macro f1score"),
+    "weighted_precision": ("weighted precision",),
+    "weighted_recall": ("weighted recall",),
+    "weighted_f1": ("weighted f1", "weighted f1 score"),
+    "macro_specificity": ("macro specificity",),
+    "mcc": ("mcc", "matthews correlation coefficient"),
+    "inference_ms": ("avg inference (ms/image)", "avg inference ms/image",
+                     "avg inference ms image", "avg inference ms"),
+}
+_PERCENT_KEYS = ("accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_f1",
+                 "weighted_precision", "weighted_recall", "weighted_f1", "macro_specificity")
+_REQUIRED = (("model", "Model"), ("accuracy", "Accuracy"), ("macro_f1", "Macro F1"))
+
+# Row order and labels for the optional detailed table.
+DETAIL_ROWS = (
+    ("Test images", "test_images"),
+    ("Accuracy", "accuracy"),
+    ("Balanced accuracy", "balanced_accuracy"),
+    ("Macro precision", "macro_precision"),
+    ("Macro recall", "macro_recall"),
+    ("Macro F1", "macro_f1"),
+    ("Weighted precision", "weighted_precision"),
+    ("Weighted recall", "weighted_recall"),
+    ("Weighted F1", "weighted_f1"),
+    ("Macro specificity", "macro_specificity"),
+    ("MCC (Matthews correlation)", "mcc"),
+    ("Avg inference (ms/image)", "inference_ms"),
+)
+
+
+def _norm_col(name):
+    """'Macro_F1', 'macro-f1' and ' Macro  F1 ' all become 'macro f1'."""
+    return " ".join(str(name).strip().lower().replace("_", " ").replace("-", " ").split())
+
+
+def _norm_model(name):
+    """'EfficientNet-B3' and 'efficientnet b3' both become 'efficientnetb3'."""
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _parse_score(value):
+    """
+    Parse a 0-1 decimal or a 0-100 percentage into a percentage (0-100).
+    A value is multiplied by 100 only when it is a decimal in [0, 1], so a value
+    that is already a percentage is never scaled twice. A trailing '%' marks an
+    explicit percentage. Returns None for missing, non-numeric or out-of-range values.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    explicit_percent = text.endswith("%")
+    if explicit_percent:
+        text = text[:-1].strip()
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    if explicit_percent:
+        return number if 0 <= number <= 100 else None
+    if 0 <= number <= 1:
+        return number * 100
+    if 1 < number <= 100:
+        return number
+    return None
+
+
+def _parse_number(value, minimum=None, maximum=None):
+    """Parse a plain finite number, optionally range-checked. None if invalid."""
+    if value is None:
+        return None
+    try:
+        number = float(str(value).strip())
+    except ValueError:
+        return None
+    if not math.isfinite(number):
+        return None
+    if minimum is not None and number < minimum:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    return number
+
+
+@st.cache_data(show_spinner=False)
+def _read_evaluation(csv_path, mtime):
+    """
+    Read results/model_comparison.csv. `mtime` is only part of the cache key, so the
+    cache refreshes automatically whenever the file changes on disk.
+
+    Returns {"performance": {...}, "details": {...}, "issues": [...]}.
+    Invalid or missing metrics are skipped and reported, never replaced by defaults.
+    """
+    performance, details, issues = {}, {}, []
+
+    def result():
+        return {"performance": performance, "details": details, "issues": issues}
+
+    try:
+        with open(csv_path, "r", newline="", encoding="utf-8-sig") as file:
+            reader = csv.DictReader(file)
+            headers = [c for c in (reader.fieldnames or []) if c]
+            if not headers:
+                issues.append("`results/model_comparison.csv` is empty or has no header row.")
+                return result()
+
+            lookup = {_norm_col(c): c for c in headers}
+            cols = {}
+            for key, aliases in _COLUMN_ALIASES.items():
+                for alias in aliases:
+                    if alias in lookup:
+                        cols[key] = lookup[alias]
+                        break
+
+            missing = [label for key, label in _REQUIRED if key not in cols]
+            if missing:
+                issues.append("`results/model_comparison.csv` is missing required column(s): "
+                              + ", ".join(missing) + ".")
+                return result()
+
+            supported = {_norm_model(n): n for n in EVAL_MODELS}
+            for row in reader:
+                canonical = supported.get(_norm_model(row.get(cols["model"])))
+                if canonical is None:
+                    continue
+                if canonical in performance:
+                    issues.append(f"Duplicate row for {canonical} ignored (first row used).")
+                    continue
+
+                accuracy = _parse_score(row.get(cols["accuracy"]))
+                macro_f1 = _parse_score(row.get(cols["macro_f1"]))
+                if accuracy is None or macro_f1 is None:
+                    issues.append(f"Accuracy or Macro F1 for {canonical} is missing or invalid.")
+                    continue
+
+                performance[canonical] = {"accuracy": accuracy, "macro_f1": macro_f1}
+
+                detail = {}
+                for key in _PERCENT_KEYS:
+                    if key in cols:
+                        detail[key] = _parse_score(row.get(cols[key]))
+                if "mcc" in cols:
+                    detail["mcc"] = _parse_number(row.get(cols["mcc"]), -1, 1)
+                if "inference_ms" in cols:
+                    detail["inference_ms"] = _parse_number(row.get(cols["inference_ms"]), 0)
+                if "test_images" in cols:
+                    count = _parse_number(row.get(cols["test_images"]), 0)
+                    detail["test_images"] = int(count) if count is not None else None
+                details[canonical] = detail
+
+            if not performance:
+                issues.append("No valid rows for EfficientNet-B3, ConvNeXt-Tiny or Swin-Tiny "
+                              "were found in `results/model_comparison.csv`.")
+    except FileNotFoundError:
+        issues.append("`results/model_comparison.csv` was not found next to `app.py`.")
+    except (OSError, csv.Error, UnicodeError) as error:
+        issues.append(f"`results/model_comparison.csv` could not be read ({type(error).__name__}).")
+    return result()
+
+
+def load_evaluation():
+    """Full evaluation payload (performance, details, issues), refreshed when the CSV changes."""
+    try:
+        mtime = EVAL_CSV_PATH.stat().st_mtime
+    except OSError:
+        mtime = -1.0
+    return _read_evaluation(str(EVAL_CSV_PATH), mtime)
+
+
+def load_test_performance():
+    """
+    Test-set Accuracy and Macro F1 as percentages, read from the CSV at runtime:
+        {"EfficientNet-B3": {"accuracy": ..., "macro_f1": ...}, ...}
+    Models without valid CSV metrics are simply absent from the dictionary.
+    """
+    return load_evaluation()["performance"]
+
+
+def format_detail(key, value):
+    if value is None:
+        return "—"
+    if key == "test_images":
+        return f"{int(value):,}"
+    if key == "mcc":
+        return f"{value:.4f}"
+    if key == "inference_ms":
+        return f"{value:.2f} ms"
+    return f"{value:.2f}%"
 
 
 PAGES = ["🩻  Upload & Quality", "🧠  AI Analysis", "📄  Clinical Report"]
@@ -67,12 +300,87 @@ def get_accent(key):
 # Session state
 # ======================================================
 for key in ["quality_result", "quality_image_name", "analysis_result", "classification_comparison",
-            "lesion_result", "report_path", "report_id", "image", "image_format", "image_name"]:
+            "lesion_result", "report_path", "report_id", "image", "image_format", "image_name",
+            "validation", "upload_signature"]:
     st.session_state.setdefault(key, None)
 st.session_state.setdefault("page", P_UPLOAD)
 
 RESET_KEYS = ["quality_result", "analysis_result", "classification_comparison",
               "lesion_result", "report_path", "report_id"]
+
+# Temporary files written by the pipeline. They are removed whenever a new image is
+# uploaded so that nothing from a previous image can be picked up again.
+STALE_TEMP_FILES = ("results/quality_check_image.jpg", "results/uploaded_fundus_image.jpg")
+
+
+# ======================================================
+# Fundus image validation gate
+# ======================================================
+def validation_is_valid():
+    """True only when the image currently loaded was verified as a retinal fundus image."""
+    verdict = st.session_state.get("validation")
+    return (st.session_state.get("image") is not None
+            and isinstance(verdict, dict)
+            and verdict.get("status") == "valid")
+
+
+def clear_loaded_image():
+    """Drop the loaded image and every result derived from it (called on each new upload)."""
+    for k in RESET_KEYS:
+        st.session_state[k] = None
+    for k in ("image", "image_name", "image_format", "quality_image_name", "validation"):
+        st.session_state[k] = None
+    st.session_state["show_report"] = False
+    for path in STALE_TEMP_FILES:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def run_validation(img):
+    """
+    Run utils.fundus_validator.validate_fundus_image and normalise its ValidationResult.
+    Any failure or unrecognised status is treated as 'uncertain'. It never counts as valid.
+    """
+    try:
+        with st.spinner("Verifying that this is a retinal fundus image..."):
+            verdict = validate_fundus_image(img)
+        status = str(getattr(verdict, "status", "")).strip().lower()
+        message = str(getattr(verdict, "message", "") or "")
+    except Exception:
+        return {"status": "uncertain",
+                "message": "EyeX could not verify the image type. Check the validator dependencies "
+                           "and model download, then try again."}
+    if status not in ("valid", "invalid", "uncertain"):
+        return {"status": "uncertain",
+                "message": "EyeX could not verify the image type. Please try again."}
+    return {"status": status, "message": message}
+
+
+def retry_validation():
+    """Forget the stored upload signature so the file in the uploader is validated again."""
+    st.session_state.upload_signature = None
+
+
+def process_upload(uploaded_file):
+    """Decode, clear stale state, validate, and only then expose the image to the pipeline."""
+    clear_loaded_image()
+    try:
+        img = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
+    except (UnidentifiedImageError, OSError):
+        st.session_state.validation = {
+            "status": "invalid",
+            "message": "Unable to process this image. Upload a valid fundus image."}
+        return
+    verdict = run_validation(img)
+    st.session_state.validation = verdict
+    if verdict["status"] != "valid":
+        return  # rejected or unverified: the image never reaches the analysis pipeline
+    st.session_state.image = img
+    st.session_state.image_name = uploaded_file.name
+    st.session_state.quality_image_name = uploaded_file.name
+    st.session_state.image_format = (uploaded_file.type or "unknown").split("/")[-1].upper()
 
 
 # ======================================================
@@ -316,11 +624,23 @@ hr{border-color:var(--line) !important;}
 .x-mc:hover{transform:translateY(-10px);border-color:var(--amber);box-shadow:0 24px 50px rgba(169,193,234,.15);}
 .x-mc.win::before{content:"Majority";position:absolute;top:14px;right:-30px;transform:rotate(38deg);background:var(--amber);color:#2A0A12;font-size:10.5px;font-weight:800;padding:3px 34px;}
 .x-mc .nm{font-family:'Outfit',sans-serif;font-weight:700;font-size:17px;margin-bottom:12px;}
+.x-mc .cap{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--mut);margin:0 0 6px;}
 .x-mc .pr{display:inline-block;margin:14px 0 4px;font-weight:800;font-size:13px;padding:6px 16px;border-radius:999px;background:rgba(127,160,214,.16);color:#DCE6F8;border:1px solid rgba(127,160,214,.35);}
 .x-ring.sm{width:116px;height:116px;}.x-ring.sm::before{inset:10px;}.x-ring.sm b{font-size:25px;}
-.x-mc .x-perf{grid-template-columns:62px 1fr 48px;text-align:left;}
-.x-mc .tt{font-size:11.5px;color:var(--mut);margin-top:14px;text-align:left;}
+.x-mc .x-perf{grid-template-columns:1fr auto;gap:6px 10px;text-align:left;margin-top:12px;}
+.x-mc .x-perf span:nth-child(2){font-weight:700;text-align:right;}
+.x-mc .x-perf .x-bar{grid-column:1/-1;}
+.x-mc .tt{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--mut);margin-top:18px;padding-top:14px;border-top:1px solid var(--line);text-align:left;}
+.x-mnote{font-size:12.5px;line-height:1.6;color:var(--mut);margin-top:16px;}
+.x-mnote b{color:#E2C9BA;}
 @media (max-width:900px){.x-mgrid{grid-template-columns:1fr}.x-mc:nth-child(2){margin-top:0}}
+/* ---------- detailed evaluation table ---------- */
+.x-tblwrap{overflow-x:auto;}
+.x-tbl{width:100%;border-collapse:collapse;font-size:13px;}
+.x-tbl th,.x-tbl td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;}
+.x-tbl thead th{color:var(--mut);font-size:12px;font-weight:700;}
+.x-tbl tbody th{color:var(--mut);font-weight:600;}
+.x-tbl th:first-child{text-align:left;}
 /* ---------- big gradcam ---------- */
 .x-stage{position:relative;border-radius:28px;padding:14px;background:radial-gradient(circle at 50% 0,rgba(142,43,79,.25),transparent 70%),#180711;border:1px solid var(--line);}
 .x-stage [data-testid="stImage"] img,.st-key-gc_stage [data-testid="stImage"] img{max-height:78vh;object-fit:contain;margin:0 auto;display:block;}
@@ -440,32 +760,36 @@ def page_upload():
                                              label_visibility="collapsed")
             st.caption("JPG, JPEG, PNG, BMP or TIFF.")
 
-            if uploaded_file is not None and st.session_state.image_name != uploaded_file.name:
-                try:
-                    img = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
-                    for k in RESET_KEYS:
-                        st.session_state[k] = None
-                    st.session_state.image = img
-                    st.session_state.image_name = uploaded_file.name
-                    st.session_state.quality_image_name = uploaded_file.name
-                    st.session_state.image_format = (uploaded_file.type or "unknown").split("/")[-1].upper()
-                except (UnidentifiedImageError, OSError):
-                    st.error("Unable to process this image. Upload a valid fundus image.")
+            if uploaded_file is not None:
+                signature = (uploaded_file.name, uploaded_file.size)
+                if st.session_state.upload_signature != signature:
+                    st.session_state.upload_signature = signature
+                    process_upload(uploaded_file)
+
+            verdict = st.session_state.validation
+            if verdict is not None:
+                if verdict["status"] == "valid":
+                    st.success("Verified as a retinal fundus image.")
+                elif verdict["status"] == "invalid":
+                    st.error(verdict["message"])
+                else:
+                    st.warning(verdict["message"])
+                    st.button("Retry validation", on_click=retry_validation, key="retry_validation")
 
         image = st.session_state.image
         if image is not None:
             with st.container(border=True):
                 st.image(image, use_container_width=True)
-                md(f"""<div class="x-info"><div><b>File</b>{st.session_state.image_name}</div>
+                md(f"""<div class="x-info"><div><b>File</b>{esc(st.session_state.image_name)}</div>
                 <div><b>Size</b>{image.width} × {image.height}px</div>
-                <div><b>Format</b>{st.session_state.image_format}</div></div>""")
+                <div><b>Format</b>{esc(st.session_state.image_format)}</div></div>""")
 
     with right:
         image = st.session_state.image
         with st.container(border=True):
             section("Image quality", "We check the photo before any AI model sees it.")
-            if image is None:
-                empty_state("🩻", "Upload an image to unlock the quality check.")
+            if image is None or not validation_is_valid():
+                empty_state("🩻", "Upload a valid retinal fundus image to unlock the quality check.")
             else:
                 if st.button("Check image quality", type="primary", use_container_width=True):
                     os.makedirs("results", exist_ok=True)
@@ -523,6 +847,10 @@ def page_analysis():
 
     if image is None:
         empty_state("👁️", "No image yet. Upload a fundus photo first.", "Go to upload", P_UPLOAD, "a_up")
+        return
+    if not validation_is_valid():
+        empty_state("🛡️", "This image has not been verified as a retinal fundus image. "
+                          "Upload a valid retinal image first.", "Go to upload", P_UPLOAD, "a_val")
         return
     if qr is None:
         empty_state("🩻", "Run the image quality check before the AI analysis.", "Go to quality check", P_UPLOAD, "a_q")
@@ -599,14 +927,14 @@ def page_analysis():
         with st.container(border=True):
             md(f"""<div style="border-left:5px solid {accent['color']};padding-left:18px;">
             <div class="x-label">Predicted condition</div>
-            <div class="x-big" style="color:{accent['color']}">{result['disease']}</div>
-            <div class="x-chipline" style="background:{accent['color']}22;color:{accent['color']}">{accent['label']}</div>
+            <div class="x-big" style="color:{accent['color']}">{esc(result['disease'])}</div>
+            <div class="x-chipline" style="background:{accent['color']}22;color:{accent['color']}">{esc(accent['label'])}</div>
             <div class="x-bar" style="margin-top:22px"><div style="width:{conf * 100:.1f}%"></div></div>
             <div class="x-label" style="margin-top:8px">Confidence {conf * 100:.2f}%</div></div>""")
             if comparison is not None:
                 ag = comparison["agreement"]
                 md(f"""<div class="x-info" style="margin-top:18px"><div><b>Model agreement</b>{ag["agreement_count"]}/{ag["total_models"]} ({ag["agreement_ratio"] * 100:.0f}%)</div>
-                <div><b>Majority prediction</b>{ag["final_prediction"]}</div></div>""")
+                <div><b>Majority prediction</b>{esc(ag["final_prediction"])}</div></div>""")
     with c2:
         with st.container(border=True):
             md(f"""<div class="x-label" style="text-align:center">Model confidence</div>
@@ -645,35 +973,138 @@ def page_analysis():
     # ---------- Model comparison ----------
     if comparison is not None:
         st.write("")
-        section("Three models, one verdict", "How each model read this image, and how each performed on the test set.")
+
+        section(
+            "Three models, one verdict",
+            "How each model read this image, and how each performed on the test set."
+        )
+
         model_results = comparison["models"]
         ag = comparison["agreement"]
-        votes = "".join(f'<div class="x-vote {"y" if i < ag["agreement_count"] else ""}">{"✓" if i < ag["agreement_count"] else "–"}</div>'
-                        for i in range(ag["total_models"]))
-        md(f"""<div class="x-cons"><div class="x-votes">{votes}</div>
-        <div><div class="x-label">Consensus</div><div class="x-big" style="font-size:34px">{ag["final_prediction"]}</div></div>
-        <div style="margin-left:auto"><div class="x-label">Agreement</div>
-        <div class="x-big" style="font-size:34px">{ag["agreement_count"]}/{ag["total_models"]} <span style="font-size:15px;color:var(--mut)">{ag["agreement_ratio"] * 100:.0f}% agree</span></div></div></div>""")
-        perf = {"EfficientNet-B3": (84.22, 77.21), "ConvNeXt-Tiny": (78.50, 74.31), "Swin-Tiny": (79.40, 75.87)}
+
+        votes = "".join(
+            f'<div class="x-vote {"y" if i < ag["agreement_count"] else ""}">'
+            f'{"✓" if i < ag["agreement_count"] else "–"}</div>'
+            for i in range(ag["total_models"])
+        )
+
+        md(f"""
+        <div class="x-cons">
+            <div class="x-votes">{votes}</div>
+            <div>
+                <div class="x-label">Consensus</div>
+                <div class="x-big" style="font-size:34px">
+                    {esc(ag["final_prediction"])}
+                </div>
+            </div>
+            <div style="margin-left:auto">
+                <div class="x-label">Agreement</div>
+                <div class="x-big" style="font-size:34px">
+                    {ag["agreement_count"]}/{ag["total_models"]}
+                    <span style="font-size:15px;color:var(--mut)">
+                        {ag["agreement_ratio"] * 100:.0f}% agree
+                    </span>
+                </div>
+            </div>
+        </div>
+        """)
+
+        # Test-set metrics come exclusively from results/model_comparison.csv.
+        evaluation = load_evaluation()
+        performance = evaluation["performance"]
+        details = evaluation["details"]
+
+        if evaluation["issues"]:
+            st.warning("Test-set metrics could not be fully loaded. "
+                       + " ".join(evaluation["issues"])
+                       + " Image predictions are not affected.")
+
         cards = ""
-        for name in ["EfficientNet-B3", "ConvNeXt-Tiny", "Swin-Tiny"]:
+
+        for name in EVAL_MODELS:
             mr = model_results.get(name)
+
             if mr is None:
                 continue
-            cf = mr.get("confidence", 0.0) * 100
+
+            # Prediction confidence for THIS image (from inference, not from the CSV).
+            cf = clamp_pct(safe_float(mr.get("confidence", 0.0)) * 100)
             pred = mr.get("prediction", "Not available")
+            ring_color = get_accent(pred)["color"]
+
             win = "win" if str(pred) == str(ag["final_prediction"]) else ""
-            acc, f1 = perf[name]
-            cards += (f'<div class="x-mc {win}"><div class="nm">{name}</div>'
-                      f'<div class="x-ring sm" style="--p:{round(cf)};--c:{get_accent(pred)["color"]}"><b></b></div>'
-                      f'<div class="pr">{pred}</div><div class="x-label" style="margin-top:6px">{cf:.2f}% on this image</div>'
-                      f'<div class="tt">Test-set performance</div>'
-                      f'<div class="x-perf"><span>Accuracy</span><div class="x-bar"><div style="width:{acc}%"></div></div><span>{acc:.1f}%</span></div>'
-                      f'<div class="x-perf"><span>Macro F1</span><div class="x-bar"><div style="width:{f1}%"></div></div><span>{f1:.1f}%</span></div></div>')
+
+            metrics = performance.get(name)
+
+            if metrics is not None:
+                acc = clamp_pct(metrics["accuracy"])
+                f1 = clamp_pct(metrics["macro_f1"])
+                n_images = details.get(name, {}).get("test_images")
+                n_text = f" · {n_images:,} images" if n_images else ""
+
+                performance_html = (
+                    f'<div class="tt">Test-set performance{n_text}</div>'
+
+                    '<div class="x-perf">'
+                    '<span>Test-set Accuracy</span>'
+                    f'<span>{acc:.2f}%</span>'
+                    '<div class="x-bar">'
+                    f'<div style="width:{acc:.2f}%"></div>'
+                    '</div>'
+                    '</div>'
+
+                    '<div class="x-perf">'
+                    '<span>Test-set Macro F1</span>'
+                    f'<span>{f1:.2f}%</span>'
+                    '<div class="x-bar">'
+                    f'<div style="width:{f1:.2f}%"></div>'
+                    '</div>'
+                    '</div>'
+                )
+            else:
+                performance_html = (
+                    '<div class="tt">Test-set performance</div>'
+                    '<div class="x-label" style="margin-top:10px">'
+                    'Metrics unavailable. Check results/model_comparison.csv.'
+                    '</div>'
+                )
+
+            cards += (
+                f'<div class="x-mc {win}">'
+                f'<div class="nm">{esc(name)}</div>'
+                '<div class="cap">Prediction confidence · this image</div>'
+                f'<div class="x-ring sm" style="--p:{round(cf)};--c:{ring_color}">'
+                '<b></b>'
+                '</div>'
+                f'<div class="pr">{esc(pred)}</div>'
+                f'<div class="x-label" style="margin-top:6px">'
+                f'{cf:.2f}% confidence for the uploaded image'
+                '</div>'
+                f'{performance_html}'
+                '</div>'
+            )
+
         if cards:
             md(f'<div class="x-mgrid">{cards}</div>')
+            md('<div class="x-mnote"><b>Prediction confidence</b> describes this uploaded image only. '
+               '<b>Test-set Accuracy</b> and <b>Test-set Macro F1</b> describe how each model performed '
+               'on the evaluation dataset, read from results/model_comparison.csv.</div>')
         else:
             st.warning("Model comparison results are not available.")
+
+        # Optional detailed evaluation table (all values loaded from the CSV).
+        if details:
+            st.write("")
+            with st.expander("Detailed test-set evaluation (from results/model_comparison.csv)"):
+                head = "".join(f"<th>{esc(n)}</th>" for n in EVAL_MODELS)
+                body = ""
+                for label, key in DETAIL_ROWS:
+                    cells = "".join(
+                        f"<td>{esc(format_detail(key, details.get(n, {}).get(key)))}</td>"
+                        for n in EVAL_MODELS)
+                    body += f"<tr><th>{esc(label)}</th>{cells}</tr>"
+                md(f'<div class="x-tblwrap"><table class="x-tbl"><thead><tr><th>Metric</th>{head}</tr></thead>'
+                   f'<tbody>{body}</tbody></table></div>')
 
     # ---------- Lesions ----------
     lesion_result = st.session_state.lesion_result
@@ -715,6 +1146,10 @@ def page_analysis():
 # ======================================================
 def page_report():
     s = st.session_state
+    if not validation_is_valid():
+        empty_state("🛡️", "No verified retinal fundus image is loaded, so no report can be generated.",
+                    "Go to upload", P_UPLOAD, "r_val")
+        return
     result = s.analysis_result
     if result is None:
         empty_state("📄", "Run the AI analysis first. The report is built from its results.",
@@ -729,7 +1164,7 @@ def page_report():
             section("Clinical screening report", "Everything below goes into the PDF.")
             items = [
                 ("Image quality", "Sharpness, brightness, contrast, resolution", s.quality_result is not None),
-                ("Classification", f"{result['disease']} at {result['confidence'] * 100:.1f}% confidence", True),
+                ("Classification", f"{esc(result['disease'])} at {result['confidence'] * 100:.1f}% confidence", True),
                 ("Model comparison", "EfficientNet-B3, ConvNeXt-Tiny, Swin-Tiny", s.classification_comparison is not None),
                 ("Grad-CAM explanation", "Heatmap and overlay", True),
                 ("Lesion analysis", "Included for DR cases", result["disease"] == "DR" and lesion_result is not None),
@@ -786,10 +1221,10 @@ def page_report():
 
     with right:
         ready = bool(s.report_path)
-        md(f"""<div class="x-doc"><div class="x-label">{"Report " + str(s.report_id) if ready else "Report preview"}</div>
+        md(f"""<div class="x-doc"><div class="x-label">{"Report " + esc(s.report_id) if ready else "Report preview"}</div>
         <div class="x-big" style="font-size:30px">EyeX screening</div>
         <div class="ln" style="width:70%"></div><div class="ln"></div><div class="ln" style="width:85%"></div>
-        <div class="x-chipline" style="background:{get_accent(result['disease'])['color']}22;color:{get_accent(result['disease'])['color']}">{result['disease']}</div>
+        <div class="x-chipline" style="background:{get_accent(result['disease'])['color']}22;color:{get_accent(result['disease'])['color']}">{esc(result['disease'])}</div>
         <div class="ln" style="width:55%"></div><div class="ln"></div><div class="ln" style="width:75%"></div></div>""")
 
     if st.session_state.get("show_report"):
@@ -798,7 +1233,7 @@ def page_report():
         acc = get_accent(result["disease"])
         qhtml = ""
         if qr:
-            qhtml = (f'<h4>Image quality: {qr["quality"]}</h4><div class="x-kv">'
+            qhtml = (f'<h4>Image quality: {esc(qr["quality"])}</h4><div class="x-kv">'
                      f'<div><b>Sharpness</b>{qr["sharpness"]:.2f}</div><div><b>Brightness</b>{qr["brightness"]:.2f}</div>'
                      f'<div><b>Contrast</b>{qr["contrast"]:.2f}</div><div><b>Resolution</b>{qr["width"]} × {qr["height"]}</div>'
                      f'<div><b>Checks passed</b>{qr["passed_checks"]} of 4</div></div>')
@@ -806,20 +1241,20 @@ def page_report():
         cmp_ = s.classification_comparison
         if cmp_:
             ag = cmp_["agreement"]
-            rows = "".join(f'<div><b>{n}</b>{m.get("prediction", "n/a")} · {m.get("confidence", 0.0) * 100:.1f}%</div>'
+            rows = "".join(f'<div><b>{esc(n)}</b>{esc(m.get("prediction", "n/a"))} · {safe_float(m.get("confidence", 0.0)) * 100:.1f}%</div>'
                            for n, m in cmp_["models"].items())
-            chtml = f'<h4>Model comparison: {ag["agreement_count"]}/{ag["total_models"]} agree on {ag["final_prediction"]}</h4><div class="x-kv">{rows}</div>'
+            chtml = f'<h4>Model comparison: {ag["agreement_count"]}/{ag["total_models"]} agree on {esc(ag["final_prediction"])}</h4><div class="x-kv">{rows}</div>'
         lhtml = ""
         if lesion_result is not None and result["disease"] == "DR":
-            rows = "".join(f'<div><b>{n}</b>{"Detected" if v["detected"] else "Not detected"} · {v["percentage"]:.3f}% · {v["regions"]:,} regions</div>'
+            rows = "".join(f'<div><b>{esc(n)}</b>{"Detected" if v["detected"] else "Not detected"} · {v["percentage"]:.3f}% · {v["regions"]:,} regions</div>'
                            for n, v in lesion_result["statistics"].items())
             lhtml = f'<h4>Lesion analysis</h4><div class="x-kv">{rows}</div>'
         st.write("")
         md(f"""<div class="x-sheet"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px">
         {wordmark(40, "Clinical screening report")}
-        <div class="x-kv" style="min-width:280px"><div><b>Report ID</b>{s.report_id or "Not yet generated"}</div><div><b>Date</b>{datetime.date.today():%d %b %Y}</div></div></div>
-        <h4>Result</h4><div class="x-kv"><div><b>Predicted condition</b><span style="color:{acc['color']};font-weight:800;font-size:17px">{result['disease']}</span></div>
-        <div><b>Classification</b>{acc['label']}</div><div><b>Confidence</b>{result['confidence'] * 100:.2f}%</div></div>
+        <div class="x-kv" style="min-width:280px"><div><b>Report ID</b>{esc(s.report_id) if s.report_id else "Not yet generated"}</div><div><b>Date</b>{datetime.date.today():%d %b %Y}</div></div></div>
+        <h4>Result</h4><div class="x-kv"><div><b>Predicted condition</b><span style="color:{acc['color']};font-weight:800;font-size:17px">{esc(result['disease'])}</span></div>
+        <div><b>Classification</b>{esc(acc['label'])}</div><div><b>Confidence</b>{result['confidence'] * 100:.2f}%</div></div>
         {qhtml}{chtml}{lhtml}</div>""")
         rc1, rc2 = st.columns(2, gap="medium")
         with rc1:
